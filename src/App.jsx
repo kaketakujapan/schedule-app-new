@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { CalendarPlus2, Check, Copy, LoaderCircle, Plus, Share2, Trash2 } from 'lucide-react'
 import { AnimatePresence, motion } from 'framer-motion'
 
@@ -12,6 +12,10 @@ function nowIsoDate() {
   return new Date().toISOString().slice(0, 10)
 }
 
+function nowIsoDateTime() {
+  return new Date().toISOString()
+}
+
 function emptyCandidate() {
   return {
     id: uid(),
@@ -22,11 +26,16 @@ function emptyCandidate() {
 }
 
 function readStore() {
+  const map = {}
   try {
     const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}')
-    return parsed && typeof parsed === 'object' ? parsed : {}
+    if (!parsed || typeof parsed !== 'object') return map
+    Object.entries(parsed).forEach(([key, raw]) => {
+      map[key] = normalizeEvent(raw, key)
+    })
+    return map
   } catch {
-    return {}
+    return map
   }
 }
 
@@ -46,11 +55,32 @@ function goTo(hashPath) {
   window.location.hash = hashPath
 }
 
+function getStatus(event) {
+  if (event.confirmedSlot) return '確定済み'
+  if ((event.responses || []).length > 0) return '回答済み'
+  return '回答待ち'
+}
+
+function statusRank(status) {
+  if (status === '回答済み') return 0
+  if (status === '回答待ち') return 1
+  return 2
+}
+
 function formatDate(date) {
   if (!date) return '日付未設定'
   const d = new Date(`${date}T00:00:00`)
   if (Number.isNaN(d.getTime())) return date
   return `${d.getMonth() + 1}月${d.getDate()}日`
+}
+
+function formatDateTime(iso) {
+  if (!iso) return '-'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return '-'
+  return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(
+    d.getMinutes()
+  ).padStart(2, '0')}`
 }
 
 function formatSlot(slot) {
@@ -118,6 +148,38 @@ function createIcs(event, slot) {
   return new Blob([body], { type: 'text/calendar;charset=utf-8' })
 }
 
+function buildUrls(id) {
+  const base = `${window.location.origin}${window.location.pathname}`
+  return {
+    guest: `${base}#/guest/${id}`,
+    organizer: `${base}#/organizer/${id}`,
+    confirmed: `${base}#/confirmed/${id}`
+  }
+}
+
+function normalizeEvent(raw, fallbackId) {
+  const id = raw?.id || raw?.eventId || fallbackId || uid()
+  const urls = buildUrls(id)
+  const responses = Array.isArray(raw?.responses) ? raw.responses : []
+  return {
+    id,
+    eventName: raw?.eventName || raw?.title || '',
+    purpose: raw?.purpose || '',
+    duration: Number(raw?.duration || raw?.durationMin || 60),
+    memo: raw?.memo || '',
+    contactName: raw?.contactName || '',
+    company: raw?.company || '',
+    contactChannel: raw?.contactChannel || '',
+    adminMemo: raw?.adminMemo || '',
+    createdAt: raw?.createdAt || nowIsoDateTime(),
+    responses,
+    confirmedSlot: raw?.confirmedSlot || null,
+    guestUrl: raw?.guestUrl || urls.guest,
+    organizerUrl: raw?.organizerUrl || urls.organizer,
+    confirmedUrl: raw?.confirmedUrl || urls.confirmed
+  }
+}
+
 function App() {
   const [route, setRoute] = useState(parseRoute())
   const [store, setStore] = useState(readStore)
@@ -141,15 +203,6 @@ function App() {
 
   const event = route.eventId ? store[route.eventId] : null
 
-  const buildUrls = (id) => {
-    const base = `${window.location.origin}${window.location.pathname}`
-    return {
-      guest: `${base}#/guest/${id}`,
-      organizer: `${base}#/organizer/${id}`,
-      confirmed: `${base}#/confirmed/${id}`
-    }
-  }
-
   const copyText = async (text, key) => {
     try {
       await navigator.clipboard.writeText(text)
@@ -168,7 +221,7 @@ function App() {
       [id]: {
         id,
         ...payload,
-        eventId: id,
+        createdAt: nowIsoDateTime(),
         guestUrl: urls.guest,
         organizerUrl: urls.organizer,
         confirmedUrl: urls.confirmed,
@@ -177,7 +230,8 @@ function App() {
         updatedAt: Date.now()
       }
     }))
-    goTo(`/create/${id}`)
+    setNotice('日程調整を作成しました。一覧からURLをコピーできます。')
+    goTo('/create')
   }
 
   const onSubmitResponses = (id, payload) => {
@@ -223,6 +277,16 @@ function App() {
     goTo('/')
   }
 
+  const onDeleteEvent = (id) => {
+    setStore((prev) => {
+      if (!prev[id]) return prev
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
+    setNotice('日程調整を削除しました。')
+  }
+
   const currentStep =
     route.role === 'guest' ? 2 : route.role === 'organizer' ? 3 : route.role === 'confirmed' ? 4 : 1
 
@@ -244,7 +308,15 @@ function App() {
           </div>
         )}
         {!loading && route.role === 'create' && (
-          <CreateScreen event={event} onCreate={onCreateEvent} copyText={copyText} copied={copied} onReset={resetData} />
+          <DashboardScreen
+            store={store}
+            onCreate={onCreateEvent}
+            copyText={copyText}
+            copied={copied}
+            onReset={resetData}
+            onOpenOrganizer={(id) => goTo(`/organizer/${id}`)}
+            onDeleteEvent={onDeleteEvent}
+          />
         )}
         {!loading && route.role === 'guest' && event && <GuestScreen event={event} onSubmitResponses={onSubmitResponses} />}
         {!loading && route.role === 'organizer' && event && <OrganizerScreen event={event} onConfirm={onConfirm} copyText={copyText} copied={copied} />}
@@ -274,18 +346,126 @@ function StepIndicator({ current }) {
   )
 }
 
-function CreateScreen({ event, onCreate, copyText, copied, onReset }) {
+function DashboardScreen({ store, onCreate, copyText, copied, onReset, onOpenOrganizer, onDeleteEvent }) {
+  const [query, setQuery] = useState('')
+  const [statusFilter, setStatusFilter] = useState('すべて')
+  const [sortBy, setSortBy] = useState('新しい順')
+
+  const events = useMemo(() => Object.values(store || {}), [store])
+  const stats = useMemo(() => {
+    const total = events.length
+    const waiting = events.filter((e) => getStatus(e) === '回答待ち').length
+    const answered = events.filter((e) => getStatus(e) === '回答済み').length
+    const fixed = events.filter((e) => getStatus(e) === '確定済み').length
+    return { total, waiting, answered, fixed }
+  }, [events])
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    const searched = events.filter((event) => {
+      const fields = [
+        event.contactName,
+        event.company,
+        event.eventName,
+        event.purpose,
+        event.contactChannel,
+        event.adminMemo
+      ]
+        .join(' ')
+        .toLowerCase()
+      const status = getStatus(event)
+      const hit = q ? fields.includes(q) : true
+      const byStatus = statusFilter === 'すべて' ? true : status === statusFilter
+      return hit && byStatus
+    })
+    const sorted = [...searched]
+    sorted.sort((a, b) => {
+      if (sortBy === '古い順') return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+      if (sortBy === '回答済みを上に表示') return statusRank(getStatus(a)) - statusRank(getStatus(b))
+      if (sortBy === '確定済みを下に表示') {
+        const aConfirmed = getStatus(a) === '確定済み' ? 1 : 0
+        const bConfirmed = getStatus(b) === '確定済み' ? 1 : 0
+        if (aConfirmed !== bConfirmed) return aConfirmed - bConfirmed
+      }
+      return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    })
+    return sorted
+  }, [events, query, statusFilter, sortBy])
+
+  return (
+    <>
+      <section className="dashboard-head">
+        <h1>主催者ダッシュボード</h1>
+        <p className="lead">URLを手動で管理しなくても、ここで相手・案件・ステータスを一元管理できます。</p>
+        <div className="kpi-grid">
+          <Kpi label="作成済み件数" value={stats.total} />
+          <Kpi label="回答待ち" value={stats.waiting} />
+          <Kpi label="回答済み" value={stats.answered} />
+          <Kpi label="確定済み" value={stats.fixed} />
+        </div>
+      </section>
+
+      <CreateForm onCreate={onCreate} />
+
+      <section className="list-head">
+        <h2>作成済み日程調整一覧</h2>
+        <div className="toolbar">
+          <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="相手・会社・イベント名・目的・連絡場所・管理メモで検索" />
+          <div className="toolbar-group">
+            <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+              <option>すべて</option>
+              <option>回答待ち</option>
+              <option>回答済み</option>
+              <option>確定済み</option>
+            </select>
+            <select value={sortBy} onChange={(e) => setSortBy(e.target.value)}>
+              <option>新しい順</option>
+              <option>古い順</option>
+              <option>回答済みを上に表示</option>
+              <option>確定済みを下に表示</option>
+            </select>
+          </div>
+        </div>
+      </section>
+
+      <section className="stack">
+        {filtered.map((event) => (
+          <EventCard
+            key={event.id}
+            event={event}
+            copied={copied}
+            copyText={copyText}
+            onOpenOrganizer={onOpenOrganizer}
+            onDeleteEvent={onDeleteEvent}
+          />
+        ))}
+      </section>
+
+      {!filtered.length && <div className="empty">条件に合う日程調整が見つかりません。</div>}
+
+      <button className="link-btn" onClick={onReset}>
+        テストデータをリセット
+      </button>
+    </>
+  )
+}
+
+function CreateForm({ onCreate }) {
   const [eventName, setEventName] = useState('')
   const [purpose, setPurpose] = useState('')
   const [duration, setDuration] = useState('60')
   const [memo, setMemo] = useState('')
+  const [contactName, setContactName] = useState('')
+  const [company, setCompany] = useState('')
+  const [contactChannel, setContactChannel] = useState('')
+  const [adminMemo, setAdminMemo] = useState('')
   const [error, setError] = useState('')
 
-  const canSubmit = eventName.trim() && purpose.trim() && Number(duration) > 0
+  const canSubmit = eventName.trim() && purpose.trim() && contactName.trim() && Number(duration) > 0
 
   const submit = () => {
     if (!canSubmit) {
-      setError('イベント名・目的・所要時間を入力してください。')
+      setError('相手の名前・イベント名・目的・所要時間を入力してください。')
       return
     }
     setError('')
@@ -293,16 +473,34 @@ function CreateScreen({ event, onCreate, copyText, copied, onReset }) {
       eventName: eventName.trim(),
       purpose: purpose.trim(),
       duration: Number(duration),
-      memo: memo.trim()
+      memo: memo.trim(),
+      contactName: contactName.trim(),
+      company: company.trim(),
+      contactChannel: contactChannel.trim(),
+      adminMemo: adminMemo.trim()
     })
+    setEventName('')
+    setPurpose('')
+    setDuration('60')
+    setMemo('')
+    setContactName('')
+    setCompany('')
+    setContactChannel('')
+    setAdminMemo('')
   }
 
   return (
-    <>
-      <h1>新しい日程調整を作成</h1>
-      <p className="lead">イベントの目的だけを共有し、候補日時は相手から集めます。最後に主催者が一つを選び、確定URLを共有できます。</p>
-
+    <section className="create-card">
+      <h2>新規日程調整作成</h2>
       <section className="stack">
+        <div className="grid two">
+          <Field label="相手の名前" required>
+            <input value={contactName} onChange={(e) => setContactName(e.target.value)} placeholder="例: Alex / 田中さん" />
+          </Field>
+          <Field label="会社名 / 所属">
+            <input value={company} onChange={(e) => setCompany(e.target.value)} placeholder="例: Studio A / Freelance" />
+          </Field>
+        </div>
         <Field label="イベント名" required>
           <input value={eventName} onChange={(e) => setEventName(e.target.value)} placeholder="例: 初回キックオフ" />
         </Field>
@@ -317,6 +515,14 @@ function CreateScreen({ event, onCreate, copyText, copied, onReset }) {
             <input value={memo} onChange={(e) => setMemo(e.target.value)} placeholder="任意" />
           </Field>
         </div>
+        <div className="grid two">
+          <Field label="連絡場所">
+            <input value={contactChannel} onChange={(e) => setContactChannel(e.target.value)} placeholder="例: Instagram DM / Gmail / LINE" />
+          </Field>
+          <Field label="管理用メモ">
+            <input value={adminMemo} onChange={(e) => setAdminMemo(e.target.value)} placeholder="例: 先方の返信は夜が多い" />
+          </Field>
+        </div>
       </section>
 
       {error && <div className="error">{error}</div>}
@@ -324,20 +530,84 @@ function CreateScreen({ event, onCreate, copyText, copied, onReset }) {
       <button className="btn primary" disabled={!canSubmit} onClick={submit}>
         URLを生成する
       </button>
+    </section>
+  )
+}
 
-      {event && (
-        <section className="created-box">
-          <h2>URLを発行しました</h2>
-          <p className="muted">この時点では候補日時はまだありません。回答者にURLを共有して入力してもらってください。</p>
-          <UrlRow label="回答者用URL" url={event.guestUrl} onCopy={() => copyText(event.guestUrl, 'guest')} copied={copied === 'guest'} />
-          <UrlRow label="主催者用URL" url={event.organizerUrl} onCopy={() => copyText(event.organizerUrl, 'organizer')} copied={copied === 'organizer'} />
-        </section>
-      )}
+function Kpi({ label, value }) {
+  return (
+    <div className="kpi-card">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  )
+}
 
-      <button className="link-btn" onClick={onReset}>
-        テストデータをリセット
-      </button>
-    </>
+function EventCard({ event, copied, copyText, onOpenOrganizer, onDeleteEvent }) {
+  const status = getStatus(event)
+  const statusClass = status === '回答待ち' ? 'waiting' : status === '回答済み' ? 'answered' : 'confirmed'
+  const responseCount = (event.responses || []).length
+  const jpMessage = `${event.contactName || 'ご担当者'}さん、以下のURLからご都合の良い候補日時を3つほど入力してください。\n\n${event.guestUrl}\n\nよろしくお願いします。`
+  const enMessage = `Hi ${event.contactName || ''},\n\nPlease share at least three time options from the link below.\n\n${event.guestUrl}\n\nThank you.`
+  const remove = () => {
+    const ok = window.confirm(`「${event.contactName || '相手未設定'} / ${event.eventName || 'イベント未設定'}」を削除しますか？`)
+    if (!ok) return
+    onDeleteEvent(event.id)
+  }
+
+  return (
+    <article className="event-card">
+      <div className="event-top">
+        <div>
+          <h3>{event.contactName || '名前未設定'}</h3>
+          <p className="muted">
+            {event.company || '所属未設定'} / {event.eventName || 'イベント未設定'}
+          </p>
+        </div>
+        <span className={`status-pill ${statusClass}`}>{status}</span>
+      </div>
+
+      <p className="muted">{event.purpose || '目的未設定'}</p>
+      <div className="meta-grid">
+        <Meta label="作成日" value={formatDateTime(event.createdAt)} />
+        <Meta label="回答数" value={`${responseCount}件`} />
+        <Meta label="連絡場所" value={event.contactChannel || '-'} />
+        <Meta label="管理用メモ" value={event.adminMemo || '-'} />
+        {event.confirmedSlot && <Meta label="確定日時" value={formatSlot(event.confirmedSlot)} />}
+      </div>
+
+      <div className="event-actions">
+        <button className="btn subtle" onClick={() => copyText(event.guestUrl, `guest-${event.id}`)}>
+          {copied === `guest-${event.id}` ? 'コピーしました' : '相手に送るURLをコピー'}
+        </button>
+        <button className="btn subtle" onClick={() => onOpenOrganizer(event.id)}>
+          自分で候補を見る
+        </button>
+        <button className="btn subtle" onClick={() => copyText(event.confirmedUrl, `confirmed-${event.id}`)}>
+          {copied === `confirmed-${event.id}` ? 'コピーしました' : '確定URLをコピー'}
+        </button>
+      </div>
+      <div className="event-actions">
+        <button className="btn subtle" onClick={() => copyText(jpMessage, `jpmsg-${event.id}`)}>
+          {copied === `jpmsg-${event.id}` ? 'コピーしました' : '送信用メッセージをコピー（日本語）'}
+        </button>
+        <button className="btn subtle" onClick={() => copyText(enMessage, `enmsg-${event.id}`)}>
+          {copied === `enmsg-${event.id}` ? 'コピーしました' : 'Send message (English)'}
+        </button>
+        <button className="btn subtle danger" onClick={remove}>
+          この日程調整を削除
+        </button>
+      </div>
+    </article>
+  )
+}
+
+function Meta({ label, value }) {
+  return (
+    <div className="meta-item">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
   )
 }
 
@@ -544,6 +814,14 @@ function OrganizerScreen({ event, onConfirm, copyText, copied }) {
     <>
       <h1>届いた候補から確定</h1>
       <p className="lead">回答者が入力した候補日時を確認し、最終的な日程を一つ選んでください。</p>
+      <section className="summary soft">
+        <SummaryRow label="相手の名前" value={event.contactName || '-'} />
+        <SummaryRow label="会社名 / 所属" value={event.company || '-'} />
+        <SummaryRow label="イベント名" value={event.eventName || '-'} />
+        <SummaryRow label="目的" value={event.purpose || '-'} />
+        <SummaryRow label="連絡場所" value={event.contactChannel || '-'} />
+        <SummaryRow label="管理用メモ" value={event.adminMemo || '-'} />
+      </section>
       <p className="subject">{event.eventName} / {event.purpose}</p>
 
       <section className="url-list">
@@ -654,11 +932,12 @@ function ConfirmedScreen({ event, copyText, copied }) {
       <p className="lead">{formatSlot(slot)} に決まりました</p>
 
       <section className="summary">
+        <SummaryRow label="相手の名前" value={event.contactName || '-'} />
         <SummaryRow label="イベント名" value={event.eventName} />
         <SummaryRow label="目的" value={event.purpose} />
+        <SummaryRow label="確定日時" value={formatSlot(slot)} />
         <SummaryRow label="所要時間" value={`${event.duration}分`} />
         <SummaryRow label="メモ" value={event.memo || 'なし'} />
-        <SummaryRow label="確定した候補日時" value={formatSlot(slot)} />
         {slot.meetingUrl && <SummaryRow label="オンラインURL" value={slot.meetingUrl} />}
       </section>
 
